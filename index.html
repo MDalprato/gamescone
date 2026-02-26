@@ -1,0 +1,1302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CODE &amp; SURVIVE — NYC Dev vs Aliens</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Courier New', monospace;
+      overflow: hidden;
+      user-select: none;
+    }
+    #gameCanvas {
+      border: 2px solid #00ff88;
+      box-shadow: 0 0 40px #00ff8855, 0 0 80px #00ff8822;
+      cursor: crosshair;
+      display: block;
+      image-rendering: pixelated;
+    }
+    #controls {
+      margin-top: 10px;
+      font-size: 11px;
+      color: #00ff8866;
+      letter-spacing: 1.5px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="800" height="520"></canvas>
+  <div id="controls">WASD / ARROWS: MOVE &nbsp;·&nbsp; SPACE: JUMP &nbsp;·&nbsp; CLICK / Z: SHOOT TOWARD CURSOR &nbsp;·&nbsp; NYC 2024</div>
+
+<script>
+// ============================================================
+//  CODE & SURVIVE — NYC Dev vs Aliens
+//  Single-file HTML5 canvas game
+// ============================================================
+
+const canvas = document.getElementById('gameCanvas');
+const ctx    = canvas.getContext('2d');
+const W = 800, H = 520;
+
+// ─── PALETTE ────────────────────────────────────────────────
+const PAL = {
+  dark:     '#020814',
+  darkMid:  '#0a1428',
+  midBlue:  '#16213e',
+  deepBlue: '#0d2137',
+  neonG:    '#00ff88',
+  neonB:    '#00d4ff',
+  neonR:    '#ff3366',
+  neonY:    '#ffff00',
+  skin:     '#f4c896',
+  hoodie:   '#3a78c9',
+  text:     '#e0e0e0',
+  dim:      '#666688',
+};
+
+// ─── AUDIO ──────────────────────────────────────────────────
+let ac = null;
+function initAudio() {
+  if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+}
+function tone(freq, type, dur, vol = 0.15, delay = 0) {
+  if (!ac) return;
+  const t = ac.currentTime + delay;
+  const o = ac.createOscillator();
+  const g = ac.createGain();
+  o.connect(g); g.connect(ac.destination);
+  o.type = type; o.frequency.setValueAtTime(freq, t);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.start(t); o.stop(t + dur);
+}
+const sfx = {
+  shoot:   () => { tone(900,'square',0.08,0.18); tone(600,'square',0.06,0.10,0.04); },
+  explode: () => [300,220,160,100].forEach((f,i) => tone(f,'sawtooth',0.18,0.25,i*0.03)),
+  hurt:    () => tone(180,'sawtooth',0.25,0.35),
+  alarm:   () => [880,440,880,440].forEach((f,i) => tone(f,'square',0.12,0.22,i*0.16)),
+  coffee:  () => [523,659,784].forEach((f,i) => tone(f,'triangle',0.2,0.18,i*0.1)),
+  pickup:  () => { tone(440,'triangle',0.1,0.2); tone(660,'triangle',0.12,0.2,0.1); tone(880,'triangle',0.15,0.2,0.22); },
+  uiClick: () => tone(300,'square',0.06,0.12),
+  wave:    () => [220,330,440,660].forEach((f,i) => tone(f,'square',0.15,0.12,i*0.08)),
+  death:   () => [440,330,220,110].forEach((f,i) => tone(f,'sawtooth',0.3,0.3,i*0.1)),
+};
+
+// ─── INPUT ──────────────────────────────────────────────────
+const keys = {};
+let mx = 400, my = 300, mclick = false;
+
+document.addEventListener('keydown', e => {
+  initAudio();
+  keys[e.code] = true;
+  if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  onKey(e.code);
+});
+document.addEventListener('keyup',  e => { keys[e.code] = false; });
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mx = (e.clientX - r.left) * (W / r.width);
+  my = (e.clientY - r.top)  * (H / r.height);
+});
+canvas.addEventListener('mousedown', e => {
+  initAudio();
+  const r = canvas.getBoundingClientRect();
+  mx = (e.clientX - r.left) * (W / r.width);
+  my = (e.clientY - r.top)  * (H / r.height);
+  mclick = true;
+  onMouseDown();
+});
+
+// ─── GAME STATE ──────────────────────────────────────────────
+// States: title | daytrans | scene | news | invasion | gameover
+let gState = 'title';
+let gFrame = 0;   // global frame counter
+let day    = 1;
+let score  = 0;
+
+// ─── PLAYER ──────────────────────────────────────────────────
+const P = {
+  x: 120, y: 0,
+  vx: 0,  vy: 0,
+  w: 24,  h: 36,
+  hp: 100, maxHp: 100,
+  dir: 1,         // 1=right, -1=left
+  onGround: false,
+  shootCD: 0,
+  rapidTimer: 0,
+  shieldTimer: 0,
+  animFrame: 0,
+  animTimer: 0,
+  invTimer: 0,    // invincibility frames after hit
+};
+
+// ─── ENTITIES ────────────────────────────────────────────────
+let aliens   = [];
+let bullets  = [];
+let sparks   = [];
+let pickups  = [];
+let aliensKilled = 0;
+let waveNum  = 0;
+let spawnCD  = 120;
+let bgScroll = 0;
+
+// ─── SCENE DATA ──────────────────────────────────────────────
+let sceneIdx   = 0;
+let sceneTimer = 0;
+let transTimer = 0;
+let flashColor = null;
+let flashTimer = 0;
+
+const DAYS = {
+  1: [
+    { phase:'wakeup',    lines:['MONDAY · 7:00 AM','Your alarm goes off.',  'Another sprint, another standup.'],    cta:'CLICK TO WAKE UP' },
+    { phase:'breakfast', lines:['You brew your coffee and open Hacker News.','"The cloud is down again."', 'Classic Monday.'], cta:'CLICK FOR COFFEE' },
+    { phase:'commute',   lines:['Heading to the office via the F train.','Someone is eating a full meal in the car.','You focus on your laptop bag.'], cta:null },
+    { phase:'work',      lines:['TechCorp™ · Manhattan.','The CI/CD pipeline is broken. Again.','You spend 4 hours debugging a semicolon.'], cta:'CLICK TO CODE' },
+    { phase:'sleep',     lines:['Fixed 12 bugs. Created 15 new ones.','Ordered $24 of pad thai.',  'Goodnight, NYC.'], cta:'CLICK TO SLEEP' },
+  ],
+  2: [
+    { phase:'wakeup',    lines:['TUESDAY · 8:15 AM','Slept through the alarm.','Again.'], cta:'CLICK TO WAKE UP' },
+    { phase:'breakfast', lines:['No time. $7 bodega coffee and a run.','The bodega cat judges you.','You deserve it.'], cta:'CLICK FOR COFFEE' },
+    { phase:'work',      lines:['9 AM: Stand-up.', '"What did you do yesterday?"', '"Same as today. Meetings."'], cta:'CLICK TO STANDUP' },
+    { phase:'work2',     lines:['THREE HOURS OF MEETINGS.','You deployed zero code today.', '"But we aligned on synergies!"'], cta:'CLICK TO SURVIVE' },
+    { phase:'sleep',     lines:['Netflix and pull requests.', 'Someone merged to main without review.', 'You close the laptop. Walk away.'], cta:'CLICK TO SLEEP' },
+  ],
+  3: [
+    { phase:'wakeup',    lines:['WEDNESDAY · 7:45 AM', 'Something feels... different.','The sky is an odd color.'], cta:'CLICK TO WAKE UP' },
+    { phase:'breakfast', lines:['The news: strange objects spotted over New Jersey.', '"Probably a weather balloon."','You sip your coffee. Ignore it.'], cta:'CLICK FOR COFFEE' },
+    { phase:'commute',   lines:['The subway is eerily quiet today.','People keep looking up at their phones.', '"Probably nothing."'], cta:null },
+    { phase:'work',      lines:['You deploy a new feature.','It goes down in production immediately.', '"This is fine." 🔥'], cta:'CLICK TO HOTFIX' },
+    { phase:'sleep',     lines:['More objects on the news. Over Manhattan now.','Green lights. Hovering.','...probably nothing.'], cta:'CLICK TO SLEEP' },
+  ],
+};
+
+// ─── UTILS ───────────────────────────────────────────────────
+function rnd(min, max) { return min + Math.random() * (max - min); }
+function irnd(min, max) { return Math.floor(rnd(min, max + 1)); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function fillRect(x, y, w, h, c, alpha = 1) {
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = c;
+  ctx.fillRect(x, y, w, h);
+  ctx.globalAlpha = 1;
+}
+function txt(s, x, y, sz = 14, c = '#fff', align = 'left', bold = false) {
+  ctx.font = `${bold ? 'bold ' : ''}${sz}px 'Courier New', monospace`;
+  ctx.fillStyle = c;
+  ctx.textAlign = align;
+  ctx.fillText(s, x, y);
+  ctx.textAlign = 'left';
+}
+function glowTxt(s, x, y, sz, c, glow, align = 'center', bold = true) {
+  ctx.shadowColor = glow;
+  ctx.shadowBlur  = 18;
+  txt(s, x, y, sz, c, align, bold);
+  ctx.shadowBlur = 0;
+}
+function strokeRect(x, y, w, h, c, lw = 1, alpha = 1) {
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = c;
+  ctx.lineWidth   = lw;
+  ctx.strokeRect(x, y, w, h);
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = 1;
+}
+
+// ─── NYC BACKGROUND ──────────────────────────────────────────
+// Pre-defined building data  [x, w, h, colorIndex, layer]
+const BLDGS = [
+  // layer 0 — far (dark deep blue)
+  [0,75,210,0,0],[70,55,260,1,0],[120,90,185,0,0],[200,65,275,2,0],
+  [255,85,200,1,0],[330,75,255,0,0],[400,100,195,2,0],[490,65,280,1,0],
+  [545,85,220,0,0],[620,75,255,2,0],[690,95,185,1,0],[775,75,240,0,0],
+  // layer 1 — mid
+  [0,65,160,3,1],[55,50,200,4,1],[95,80,150,3,1],[165,55,180,4,1],
+  [210,85,145,3,1],[285,65,175,4,1],[340,75,158,3,1],[405,58,192,4,1],
+  [455,88,148,3,1],[530,65,168,4,1],[585,78,182,3,1],[655,60,158,4,1],
+  [705,80,172,3,1],[775,70,148,4,1],
+];
+const BLDG_COLS = [
+  '#0b1e30','#0f1f35','#0a1a28','#1a3a5f','#1e3a60','#1a3060','#16335a',
+];
+
+function drawBuilding(bx, by, bw, bh, colIdx) {
+  if (bx + bw < -5 || bx > W + 5) return;
+  ctx.fillStyle = BLDG_COLS[colIdx];
+  ctx.fillRect(bx, by, bw, bh);
+  // windows
+  const ws = 5, wg = 8;
+  for (let wy = by + 8; wy < by + bh - 8; wy += wg + ws) {
+    for (let wx = bx + 5; wx < bx + bw - 5; wx += wg + ws) {
+      const seed = wx * 0.31 + wy * 0.71;
+      const lit  = Math.sin(seed) > -0.2;
+      if (!lit) continue;
+      const flicker = 0.4 + 0.5 * Math.sin(seed * 2 + gFrame * 0.002);
+      ctx.fillStyle = `rgba(255,240,180,${flicker * 0.6})`;
+      ctx.fillRect(wx, wy, ws, ws);
+    }
+  }
+}
+
+function drawNYC(night = true, scroll = 0) {
+  // Sky gradient
+  const sg = ctx.createLinearGradient(0, 0, 0, H - 80);
+  if (night) {
+    sg.addColorStop(0, '#020814');
+    sg.addColorStop(0.6, '#0a1428');
+    sg.addColorStop(1,   '#0d1a3a');
+  } else {
+    sg.addColorStop(0, '#1a1428');
+    sg.addColorStop(0.5,'#0f2040');
+    sg.addColorStop(1,  '#0a2a50');
+  }
+  ctx.fillStyle = sg;
+  ctx.fillRect(0, 0, W, H - 80);
+
+  // Stars
+  if (night) {
+    for (let i = 0; i < 90; i++) {
+      const sx = ((i * 137.5) % W);
+      const sy = ((i * 73.1)  % (H - 160));
+      const br = 0.3 + 0.7 * Math.abs(Math.sin(i + gFrame * 0.015));
+      fillRect(sx, sy, 1, 1, '#fff', br * 0.7);
+    }
+  }
+
+  // Far buildings (layer 0) — slow parallax
+  const off0 = scroll * 0.15;
+  BLDGS.filter(b => b[4] === 0).forEach(([x, w, h, c]) => {
+    const bx = ((x - off0 % (W + 200) + W * 3) % (W + 200)) - 100;
+    drawBuilding(bx, H - 80 - h, w, h, c);
+  });
+
+  // Mid buildings (layer 1)
+  const off1 = scroll * 0.4;
+  BLDGS.filter(b => b[4] === 1).forEach(([x, w, h, c]) => {
+    const bx = ((x - off1 % (W + 200) + W * 3) % (W + 200)) - 100;
+    drawBuilding(bx, H - 80 - h, w, h, c);
+  });
+
+  // Ground
+  ctx.fillStyle = '#15151f';
+  ctx.fillRect(0, H - 80, W, 80);
+  ctx.fillStyle = '#222230';
+  ctx.fillRect(0, H - 80, W, 8);
+
+  // Street dashes
+  for (let i = 0; i < 12; i++) {
+    const lx = ((i * 80 - (scroll * 0.8 | 0)) % (W + 80) + W + 80) % (W + 80) - 40;
+    fillRect(lx, H - 52, 40, 4, '#ffff0018');
+  }
+
+  // Yellow cab
+  const cx = ((400 - scroll * 0.6) % (W + 120) + W + 120) % (W + 120) - 60;
+  drawCab(cx, H - 80);
+}
+
+function drawCab(x, y) {
+  ctx.fillStyle = '#e8c000';
+  ctx.fillRect(x, y - 24, 62, 20);
+  ctx.fillStyle = '#c8a400';
+  ctx.fillRect(x + 10, y - 36, 42, 16);
+  ctx.fillStyle = '#88aacc';
+  ctx.fillRect(x + 13, y - 34, 36, 12);
+  ctx.fillStyle = '#111';
+  ctx.fillRect(x + 4,  y - 5,  14, 7);
+  ctx.fillRect(x + 44, y - 5,  14, 7);
+}
+
+// ─── PLAYER DRAWING ──────────────────────────────────────────
+function drawPlayer(px, py, dir, mode) {
+  ctx.save();
+  if (dir === -1) { ctx.translate(px + P.w, 0); ctx.scale(-1, 1); px = 0; }
+
+  const blink = P.invTimer > 0 && (gFrame % 6 < 3);
+  if (blink) { ctx.restore(); return; }
+
+  const walk = Math.sin(gFrame * 0.28) * 5;
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(px + 12, py + P.h, 11, 3, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Legs
+  ctx.fillStyle = '#1a1a38';
+  ctx.fillRect(px + 4,  py + 24, 8, 13 + Math.max(0, walk));
+  ctx.fillRect(px + 12, py + 24, 8, 13 - Math.min(0, walk));
+  // Shoes
+  ctx.fillStyle = '#111';
+  ctx.fillRect(px + 2,  py + 34 + Math.max(0, walk / 3), 11, 4);
+  ctx.fillRect(px + 12, py + 34 - Math.min(0, walk / 3), 11, 4);
+
+  // Hoodie
+  ctx.fillStyle = PAL.hoodie;
+  ctx.fillRect(px + 2,  py + 10, 20, 16);
+  ctx.fillStyle = '#2a5ca0';
+  ctx.fillRect(px + 6,  py + 20, 12, 6);  // pocket
+
+  // Bag
+  ctx.fillStyle = '#7a3a10';
+  ctx.fillRect(px + 17, py + 13, 8, 11);
+  ctx.fillStyle = '#5a2a0a';
+  ctx.fillRect(px + 18, py + 11, 6, 3);
+
+  // Head
+  ctx.fillStyle = PAL.skin;
+  ctx.fillRect(px + 5, py + 2, 14, 10);
+  // Hair
+  ctx.fillStyle = '#2a1a0a';
+  ctx.fillRect(px + 4, py,     16, 5);
+  ctx.fillRect(px + 4, py + 2, 2,  4);
+  // Glasses
+  ctx.fillStyle = '#222';
+  ctx.fillRect(px + 6,  py + 4, 4, 4);
+  ctx.fillRect(px + 13, py + 4, 4, 4);
+  ctx.fillRect(px + 10, py + 5, 3, 1);
+  // Lens tint
+  ctx.fillStyle = '#00ccff';
+  ctx.globalAlpha = 0.35;
+  ctx.fillRect(px + 7,  py + 5, 2, 2);
+  ctx.fillRect(px + 14, py + 5, 2, 2);
+  ctx.globalAlpha = 1;
+
+  if (mode === 'invasion') {
+    // Gun
+    ctx.fillStyle = '#999';
+    ctx.fillRect(px + 18, py + 14, 9, 4);
+    ctx.fillStyle = '#666';
+    ctx.fillRect(px + 25, py + 13, 4, 6);
+    // Muzzle flash
+    if (P.shootCD > 10) {
+      ctx.fillStyle = '#ffff88';
+      ctx.globalAlpha = 0.8;
+      ctx.fillRect(px + 27, py + 13, 5, 4);
+      ctx.globalAlpha = 1;
+    }
+    // Rapid fire glow
+    if (P.rapidTimer > 0) {
+      ctx.shadowColor = '#ff8800';
+      ctx.shadowBlur  = 12;
+      ctx.fillStyle = '#ff8800';
+      ctx.fillRect(px + 18, py + 14, 9, 4);
+      ctx.shadowBlur = 0;
+    }
+  }
+  ctx.restore();
+}
+
+// ─── ALIEN DRAWING ───────────────────────────────────────────
+function drawAlien(a) {
+  const { x, y, type, af: animFrame } = a;
+  const bob = Math.sin(animFrame * 0.12) * 3;
+
+  if (type === 1) {
+    // Green blob
+    ctx.fillStyle = '#22cc44';
+    ctx.fillRect(x + 4, y + bob + 4, 20, 18);
+    ctx.fillRect(x,     y + bob + 8, 28, 10);
+    // Eyes
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(x + 5, y + bob + 7, 6, 6);
+    ctx.fillRect(x + 17, y + bob + 7, 6, 6);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(x + 7, y + bob + 9, 3, 3);
+    ctx.fillRect(x + 19, y + bob + 9, 3, 3);
+    // Antenna
+    ctx.fillStyle = '#22cc44';
+    ctx.fillRect(x + 11, y + bob, 2, 5);
+    ctx.fillRect(x + 9,  y + bob - 2, 6, 2);
+    // Legs
+    ctx.fillStyle = '#1a9933';
+    ctx.fillRect(x + 4, y + bob + 22, 7, 6);
+    ctx.fillRect(x + 17, y + bob + 22, 7, 6);
+  } else if (type === 2) {
+    // Blue zapper
+    ctx.fillStyle = '#3377ee';
+    ctx.fillRect(x + 2, y + bob + 2, 24, 20);
+    ctx.fillStyle = '#00eeff';
+    ctx.globalAlpha = 0.65;
+    ctx.fillRect(x + 4, y + bob + 5, 20, 8);
+    ctx.globalAlpha = 1;
+    // Zapper arms
+    ctx.fillStyle = '#2255bb';
+    ctx.fillRect(x,      y + bob + 8, 4, 8);
+    ctx.fillRect(x + 24, y + bob + 8, 4, 8);
+    ctx.strokeStyle = '#00eeff';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 2, y + bob + 2, 24, 20);
+    ctx.fillStyle = '#2255bb';
+    ctx.fillRect(x + 5, y + bob + 22, 7, 6);
+    ctx.fillRect(x + 16, y + bob + 22, 7, 6);
+  } else if (type === 3) {
+    // Red boss
+    ctx.fillStyle = '#cc2222';
+    ctx.fillRect(x, y, 36, 30);
+    ctx.fillStyle = '#882222';
+    ctx.fillRect(x + 2, y + 2,  32, 5);
+    ctx.fillRect(x + 2, y + 23, 32, 5);
+    // Glowing eyes
+    ctx.shadowColor = '#ff7700';
+    ctx.shadowBlur  = 10;
+    ctx.fillStyle   = '#ff8800';
+    ctx.fillRect(x + 6,  y + 8, 8, 6);
+    ctx.fillRect(x + 22, y + 8, 8, 6);
+    ctx.shadowBlur = 0;
+    // Mouth
+    ctx.fillStyle = '#ff3333';
+    ctx.fillRect(x + 10, y + 18, 16, 3);
+    ctx.fillStyle = '#882222';
+    ctx.fillRect(x + 4,  y + 30, 9, 8);
+    ctx.fillRect(x + 23, y + 30, 9, 8);
+    // Health bar
+    if (a.hp < a.maxHp) {
+      ctx.fillStyle = '#333';
+      ctx.fillRect(x, y - 9, 36, 5);
+      ctx.fillStyle = '#ff4444';
+      ctx.fillRect(x, y - 9, 36 * (a.hp / a.maxHp), 5);
+    }
+  } else if (type === 4) {
+    // UFO
+    ctx.fillStyle = '#8899aa';
+    ctx.fillRect(x + 6,  y + 6 + bob, 42, 10);
+    ctx.fillStyle = '#aabbcc';
+    ctx.fillRect(x + 14, y + bob, 26, 10);
+    ctx.fillStyle = '#00ddff';
+    ctx.globalAlpha = 0.55;
+    ctx.fillRect(x + 18, y + bob + 2, 18, 6);
+    ctx.globalAlpha = 1;
+    // Rotating lights
+    const lc = ['#ff3333','#33ff33','#3333ff','#ffff33'];
+    for (let i = 0; i < 4; i++) {
+      ctx.fillStyle = (Math.floor(animFrame / 8) % 4 === i) ? lc[i] : '#222';
+      ctx.fillRect(x + 10 + i * 12, y + 14 + bob, 6, 4);
+    }
+    // Beam
+    if (animFrame % 60 < 35) {
+      ctx.fillStyle = 'rgba(80,255,80,0.08)';
+      ctx.fillRect(x + 16, y + 18 + bob, 22, 36);
+    }
+    // Health bar
+    if (a.hp < a.maxHp) {
+      ctx.fillStyle = '#333';
+      ctx.fillRect(x, y - 9, 54, 5);
+      ctx.fillStyle = '#ff9900';
+      ctx.fillRect(x, y - 9, 54 * (a.hp / a.maxHp), 5);
+    }
+  }
+}
+
+// ─── PARTICLES ───────────────────────────────────────────────
+function spawnSparks(x, y, col = '#ff6600', n = 12) {
+  for (let i = 0; i < n; i++) {
+    const ang = rnd(0, Math.PI * 2);
+    const spd = rnd(1.5, 5);
+    sparks.push({ x, y, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 1,
+                  life: irnd(20, 45), maxLife: 45, col,
+                  sz: rnd(2, 4.5) });
+  }
+}
+function updateSparks() {
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const s = sparks[i];
+    s.x += s.vx; s.y += s.vy; s.vy += 0.18; s.life--;
+    if (s.life <= 0) sparks.splice(i, 1);
+  }
+}
+function drawSparks() {
+  sparks.forEach(s => {
+    ctx.globalAlpha = s.life / s.maxLife;
+    ctx.fillStyle   = s.col;
+    ctx.fillRect(s.x - s.sz / 2, s.y - s.sz / 2, s.sz, s.sz);
+  });
+  ctx.globalAlpha = 1;
+}
+
+// ─── PICKUPS ─────────────────────────────────────────────────
+function spawnPickup(x, y) {
+  const type = Math.random() < 0.5 ? 'coffee' : 'energy';
+  pickups.push({ x, y, type, life: 280, af: 0 });
+}
+function drawPickups() {
+  pickups.forEach(pk => {
+    pk.af++;
+    const bob = Math.sin(pk.af * 0.1) * 3;
+    if (pk.type === 'coffee') {
+      ctx.fillStyle = '#7a3a10';
+      ctx.fillRect(pk.x, pk.y + bob, 16, 18);
+      ctx.fillStyle = '#3a1000';
+      ctx.fillRect(pk.x + 2, pk.y + bob + 2, 12, 12);
+      if (pk.af % 22 < 11) {
+        fillRect(pk.x + 6,  pk.y - 4 + bob, 2, 4, '#ffffff44');
+        fillRect(pk.x + 10, pk.y - 6 + bob, 2, 4, '#ffffff33');
+      }
+      ctx.shadowColor = '#ff8800'; ctx.shadowBlur = 8;
+      ctx.strokeStyle = '#ff8800'; ctx.lineWidth = 1;
+      ctx.strokeRect(pk.x, pk.y + bob, 16, 18);
+      ctx.shadowBlur = 0;
+    } else {
+      ctx.fillStyle = '#111';
+      ctx.fillRect(pk.x + 2, pk.y + bob, 12, 20);
+      ctx.fillStyle = '#00ee44';
+      ctx.fillRect(pk.x + 4, pk.y + bob + 3, 8, 14);
+      ctx.shadowColor = '#00ff44'; ctx.shadowBlur = 8;
+      ctx.strokeStyle = '#00ff44'; ctx.lineWidth = 1;
+      ctx.strokeRect(pk.x + 2, pk.y + bob, 12, 20);
+      ctx.shadowBlur = 0;
+      txt('⚡', pk.x, pk.y + bob + 14, 11, '#00ff44');
+    }
+  });
+}
+
+// ─── INVASION LOGIC ──────────────────────────────────────────
+const ADATA = {
+  1: { hp:1, spd:1.6, pts:1, w:28, h:28 },
+  2: { hp:2, spd:2.1, pts:2, w:28, h:28 },
+  3: { hp:5, spd:1.1, pts:5, w:36, h:38 },
+  4: { hp:8, spd:0.7, pts:10, w:54, h:22 },
+};
+
+function spawnAlien(type) {
+  const d = ADATA[type];
+  const left = Math.random() < 0.25;
+  aliens.push({
+    x: left ? -d.w - 10 : W + 10,
+    y: (type === 4) ? rnd(60, H - 180) : H - 80 - d.h - rnd(0, 100),
+    vx: left ? d.spd : -d.spd,
+    vy: 0,
+    type, hp: d.hp, maxHp: d.hp,
+    w: d.w, h: d.h, pts: d.pts,
+    af: irnd(0, 60),
+    shootCD: irnd(80, 160),
+    onGround: false,
+  });
+}
+
+function updateAliens() {
+  for (let i = aliens.length - 1; i >= 0; i--) {
+    const a = aliens[i];
+    a.af++;
+
+    // Chase player
+    const dx = (P.x + P.w / 2) - (a.x + a.w / 2);
+    if (Math.abs(dx) > 60) {
+      a.vx = (dx > 0 ? 1 : -1) * ADATA[a.type].spd;
+    } else {
+      a.vx *= 0.85;
+    }
+
+    if (a.type === 4) {
+      // UFO floats
+      a.vy = Math.sin(a.af * 0.06) * 1.2;
+    } else {
+      a.vy += 0.4;
+      if (a.y + a.h >= H - 80) {
+        a.y = H - 80 - a.h; a.vy = 0; a.onGround = true;
+      }
+    }
+    a.x += a.vx; a.y += a.vy;
+
+    // Alien shoots (type ≥ 2)
+    if (a.type >= 2) {
+      a.shootCD--;
+      if (a.shootCD <= 0) {
+        const ddx = (P.x + 12) - (a.x + a.w / 2);
+        const ddy = (P.y + 18) - (a.y + a.h / 2);
+        const mag = Math.sqrt(ddx*ddx + ddy*ddy) || 1;
+        const spd = a.type === 4 ? 3 : 4;
+        bullets.push({
+          x: a.x + a.w / 2, y: a.y + a.h / 2,
+          vx: (ddx / mag) * spd, vy: (ddy / mag) * spd,
+          enemy: true, sz: 5, col: a.type >= 3 ? '#ff4400' : '#00ffff',
+        });
+        a.shootCD = irnd(80, 140);
+      }
+    }
+
+    // Contact damage
+    if (P.invTimer === 0 &&
+        a.x < P.x + P.w && a.x + a.w > P.x &&
+        a.y < P.y + P.h && a.y + a.h > P.y) {
+      P.hp -= 18;
+      P.invTimer = 40;
+      P.vx = (P.x - a.x) > 0 ? 5 : -5;
+      P.vy = -6;
+      sfx.hurt();
+      screenFlash('#ff0000', 8);
+    }
+
+    if (a.x < -200 || a.x > W + 200) aliens.splice(i, 1);
+  }
+}
+
+function updateBullets() {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx; b.y += b.vy;
+    let dead = false;
+
+    if (!b.enemy) {
+      // Player bullet → hit alien
+      for (let j = aliens.length - 1; j >= 0; j--) {
+        const a = aliens[j];
+        if (b.x > a.x && b.x < a.x + a.w && b.y > a.y && b.y < a.y + a.h) {
+          a.hp--;
+          spawnSparks(b.x, b.y, '#ffff00', 6);
+          if (a.hp <= 0) {
+            score += a.pts;
+            aliensKilled++;
+            const col = ['','#22cc44','#3377ee','#cc2222','#aabbcc'][a.type];
+            spawnSparks(a.x + a.w / 2, a.y + a.h / 2, col, 18);
+            sfx.explode();
+            if (Math.random() < 0.22) spawnPickup(a.x + a.w / 2, a.y);
+            aliens.splice(j, 1);
+          }
+          dead = true; break;
+        }
+      }
+    } else {
+      // Enemy bullet → hit player
+      if (P.invTimer === 0 &&
+          b.x > P.x && b.x < P.x + P.w &&
+          b.y > P.y && b.y < P.y + P.h) {
+        P.hp -= 12;
+        P.invTimer = 30;
+        sfx.hurt();
+        spawnSparks(b.x, b.y, '#ff0000', 8);
+        screenFlash('#ff0000', 6);
+        dead = true;
+      }
+    }
+    if (dead || b.x < -20 || b.x > W + 20 || b.y < -20 || b.y > H + 20)
+      bullets.splice(i, 1);
+  }
+}
+
+function updatePlayer() {
+  // Movement
+  if (keys['ArrowLeft'] || keys['KeyA']) { P.vx = -4.5; P.dir = -1; }
+  else if (keys['ArrowRight'] || keys['KeyD']) { P.vx = 4.5; P.dir = 1; }
+  else P.vx *= 0.65;
+
+  // Jump
+  if ((keys['ArrowUp'] || keys['KeyW']) && P.onGround) {
+    P.vy = -11; P.onGround = false;
+  }
+
+  // Gravity
+  P.vy += 0.5;
+  P.y  += P.vy;
+  P.x  += P.vx;
+
+  // Ground
+  if (P.y + P.h >= H - 80) {
+    P.y = H - 80 - P.h; P.vy = 0; P.onGround = true;
+  }
+  P.x = clamp(P.x, 0, W - P.w);
+  P.y = clamp(P.y, 0, H);
+
+  // Face cursor
+  if (mx > P.x + P.w / 2) P.dir = 1;
+  else P.dir = -1;
+
+  // Shoot cooldown
+  if (P.shootCD > 0) P.shootCD--;
+  if (P.invTimer > 0) P.invTimer--;
+  if (P.rapidTimer > 0) P.rapidTimer--;
+
+  // Auto-shoot with Z / F key
+  if ((keys['KeyZ'] || keys['KeyF']) && P.shootCD === 0) fireBullet();
+
+  // Pickups
+  for (let i = pickups.length - 1; i >= 0; i--) {
+    const pk = pickups[i];
+    if (pk.x < P.x + P.w && pk.x + 16 > P.x &&
+        pk.y < P.y + P.h && pk.y + 20 > P.y) {
+      if (pk.type === 'coffee') { P.rapidTimer = 360; sfx.coffee(); }
+      else { P.hp = Math.min(P.maxHp, P.hp + 30); sfx.pickup(); }
+      spawnSparks(pk.x + 8, pk.y + 10, pk.type === 'coffee' ? '#ff8800' : '#00ff44', 10);
+      pickups.splice(i, 1);
+    } else {
+      pk.life--;
+      if (pk.life <= 0) pickups.splice(i, 1);
+    }
+  }
+
+  bgScroll += P.vx * 0.5;
+}
+
+let waveSpawnCD = 100;
+function updateWaves() {
+  waveSpawnCD--;
+  if (waveSpawnCD <= 0) {
+    // Decide which type to spawn based on wave
+    const r = Math.random();
+    let type;
+    if (waveNum < 3)       { type = 1; }
+    else if (waveNum < 6)  { type = r < 0.55 ? 1 : 2; }
+    else if (waveNum < 10) { type = r < 0.45 ? 1 : r < 0.78 ? 2 : 3; }
+    else                   { type = r < 0.3 ? 1 : r < 0.58 ? 2 : r < 0.82 ? 3 : 4; }
+    spawnAlien(type);
+    // Faster spawns over time
+    waveSpawnCD = Math.max(25, 110 - waveNum * 7 - Math.floor(score / 30));
+    // Increment wave every 20 spawns
+    if (aliensKilled > 0 && aliensKilled % 12 === 0 && waveNum < 20) {
+      waveNum++;
+      sfx.wave();
+    }
+  }
+}
+
+function fireBullet() {
+  const cd = P.rapidTimer > 0 ? 5 : 14;
+  if (P.shootCD > 0) return;
+  const ox = P.dir === 1 ? P.w + 2 : -2;
+  const tx = mx - (P.x + P.w / 2);
+  const ty = my - (P.y + 14);
+  const mag = Math.sqrt(tx * tx + ty * ty) || 1;
+  const spd = 13;
+  bullets.push({
+    x: P.x + ox, y: P.y + 14,
+    vx: (tx / mag) * spd, vy: (ty / mag) * spd,
+    enemy: false, sz: 5, col: P.rapidTimer > 0 ? '#ff8800' : '#ffff00',
+  });
+  P.shootCD = cd;
+  sfx.shoot();
+  spawnSparks(P.x + ox, P.y + 14, '#ffff44', 3);
+}
+
+// ─── SCREEN FLASH ────────────────────────────────────────────
+function screenFlash(col, dur) { flashColor = col; flashTimer = dur; }
+
+// ─── HUD ─────────────────────────────────────────────────────
+function drawHUD() {
+  // HP bar
+  ctx.fillStyle = '#222';
+  ctx.fillRect(10, 10, 150, 18);
+  const hpFrac = clamp(P.hp / P.maxHp, 0, 1);
+  ctx.fillStyle = hpFrac > 0.6 ? '#00ff44' : hpFrac > 0.3 ? '#ffaa00' : '#ff2200';
+  ctx.fillRect(10, 10, 150 * hpFrac, 18);
+  strokeRect(10, 10, 150, 18, '#ffffff44', 1);
+  txt('HP ' + Math.max(0, Math.ceil(P.hp)), 14, 24, 11, '#fff');
+
+  // Score
+  glowTxt('SCORE: ' + score, W - 12, 24, 16, PAL.neonY, '#ffff0066', 'right');
+
+  // Wave
+  txt('WAVE ' + (waveNum + 1), W / 2, 24, 13, PAL.neonB, 'center');
+
+  // Rapid fire
+  if (P.rapidTimer > 0) {
+    const blink = (gFrame % 16 < 8);
+    if (blink) glowTxt('☕ RAPID FIRE', 10, 48, 11, '#ff9900', '#ff990088', 'left');
+  }
+
+  // Kill count
+  txt('⚡ ' + aliensKilled + ' ALIENS KILLED', 10, H - 10, 10, '#ff4444');
+
+  // Controls reminder (first 10s)
+  if (gFrame < 600) {
+    fillRect(W / 2 - 200, H - 30, 400, 22, 'rgba(0,0,0,0.6)');
+    txt('WASD: MOVE  |  SPACE/W: JUMP  |  CLICK / Z: SHOOT', W / 2, H - 14, 10, '#666', 'center');
+  }
+}
+
+// ─── SCENE RENDERS ───────────────────────────────────────────
+function drawTitle() {
+  drawNYC(true, gFrame * 0.4);
+
+  // Panel
+  fillRect(160, 90, 480, 300, 'rgba(0,5,20,0.85)');
+  strokeRect(160, 90, 480, 300, PAL.neonG, 2);
+
+  // Glitch effect
+  if (Math.sin(gFrame * 0.13) > 0.88) {
+    ctx.fillStyle = '#ff003344';
+    ctx.fillRect(163, 93, 474, 294);
+    txt('CODE & SURVIVE', W / 2 + 3, 165, 44, '#ff0033', 'center', true);
+  }
+  glowTxt('CODE & SURVIVE', W / 2, 165, 44, PAL.neonG, PAL.neonG, 'center');
+  txt('NYC DEV VS ALIENS', W / 2, 198, 17, PAL.neonB, 'center');
+
+  fillRect(200, 212, 400, 1, '#ffffff33');
+
+  const story = [
+    'You are ALEX — Brooklyn developer,',
+    'coffee addict, bug factory.',
+    '',
+    'Every day: wake up · coffee · code · sleep.',
+    '',
+    'Until one Wednesday...',
+    '',
+    '       ...they came from the stars.',
+  ];
+  story.forEach((l, i) =>
+    txt(l, W / 2, 235 + i * 20, 12, i === 7 ? '#ff4455' : '#999', 'center')
+  );
+
+  if (gFrame % 55 < 38)
+    glowTxt('[ CLICK OR PRESS SPACE TO START ]', W / 2, 365, 13, PAL.neonG, PAL.neonG, 'center');
+
+  txt('v1.0 · NYC 2024', W - 10, H - 10, 9, '#333', 'right');
+}
+
+function drawDayTransition() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+  const a = Math.min(1, transTimer / 35);
+  ctx.globalAlpha = a;
+  glowTxt('DAY ' + day, W / 2, H / 2 - 30, 72, PAL.neonG, PAL.neonG, 'center');
+  const subs = {1:'A New Week in NYC',2:'Same Standup, Different Day',3:'Something Feels Different...',4:'THEY HAVE ARRIVED'};
+  const col = day >= 3 ? (day === 4 ? '#ff0044' : '#ffaa00') : '#555';
+  txt(subs[day] || '', W / 2, H / 2 + 30, 18, col, 'center');
+  if (transTimer > 65 && gFrame % 55 < 38)
+    txt('[ PRESS SPACE OR CLICK ]', W / 2, H / 2 + 80, 13, '#444', 'center');
+  ctx.globalAlpha = 1;
+}
+
+function drawScene() {
+  const s = DAYS[day]?.[sceneIdx];
+  if (!s) return;
+  const ph = s.phase;
+  const night = ph === 'sleep';
+
+  // Background per phase
+  if (ph === 'work' || ph === 'work2') drawOffice();
+  else if (ph === 'commute') drawSubway();
+  else if (ph === 'sleep')   drawBedroom(true);
+  else if (ph === 'wakeup')  drawBedroom(false);
+  else if (ph === 'breakfast') drawKitchen();
+  else drawNYC(night, gFrame * 0.2);
+
+  // Dialogue box
+  const boxY = H - 130;
+  fillRect(0, boxY, W, 130, 'rgba(0,4,16,0.92)');
+  strokeRect(0, boxY, W, 130, PAL.neonG, 1);
+
+  // Portrait
+  fillRect(10, boxY + 8, 72, 112, '#0a1a28');
+  strokeRect(10, boxY + 8, 72, 112, PAL.neonG, 1);
+  drawPlayer(26, boxY + 22, 1, 'scene');
+  txt('ALEX', 46, boxY + 116, 9, PAL.neonG, 'center');
+
+  // Lines
+  s.lines.forEach((l, i) =>
+    txt(l, 98, boxY + 34 + i * 22, 13, PAL.text)
+  );
+
+  // CTA
+  if (s.cta && gFrame % 55 < 40) {
+    fillRect(W - 205, boxY + 95, 198, 26, '#00ff8818');
+    txt('▶ ' + s.cta, W - 200, boxY + 113, 11, PAL.neonG);
+  }
+  if (!s.cta && gFrame % 55 < 40)
+    txt('[ PRESS SPACE TO CONTINUE ]', W / 2, boxY + 115, 11, '#555', 'center');
+
+  sceneTimer++;
+}
+
+function drawBedroom(night) {
+  ctx.fillStyle = night ? '#07070f' : '#131325';
+  ctx.fillRect(0, 0, W, H - 80);
+  ctx.fillStyle = '#1c1008';
+  ctx.fillRect(0, H - 80, W, 80);
+
+  // Window
+  ctx.fillStyle = night ? '#000514' : '#1a2a44';
+  ctx.fillRect(W - 190, 55, 130, 110);
+  ctx.strokeStyle = '#5a3210'; ctx.lineWidth = 5;
+  ctx.strokeRect(W - 190, 55, 130, 110);
+  ctx.lineWidth = 2;
+  ctx.strokeRect(W - 125, 55, 2, 110);
+  ctx.strokeRect(W - 190, 110, 130, 2);
+  if (night) {
+    ctx.fillStyle = '#ffffcc';
+    ctx.beginPath(); ctx.arc(W - 100, 85, 16, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // Bed
+  ctx.fillStyle = '#7a3210'; ctx.fillRect(40, H - 160, 210, 90);
+  ctx.fillStyle = '#3a3aaa'; ctx.fillRect(45, H - 150, 200, 40);
+  ctx.fillStyle = '#9999cc'; ctx.fillRect(45, H - 150, 65, 42);
+
+  // Desk + monitor
+  ctx.fillStyle = '#7a3210'; ctx.fillRect(290, H - 135, 200, 65);
+  ctx.fillRect(290, H - 80, 12, 22); ctx.fillRect(478, H - 80, 12, 22);
+  ctx.fillStyle = '#111'; ctx.fillRect(340, H - 192, 110, 68);
+  ctx.fillStyle = night ? '#001a00' : '#001a33';
+  ctx.fillRect(344, H - 189, 102, 60);
+  if (!night) {
+    ['const life =','  coffee +','  code + PR;'].forEach((l, i) =>
+      txt(l, 347, H - 182 + i * 16, 9, '#00ff44')
+    );
+  }
+
+  // Alarm
+  ctx.fillStyle = '#cc2222'; ctx.fillRect(490, H - 145, 30, 26);
+  ctx.fillStyle = '#fff'; ctx.fillRect(493, H - 141, 24, 18);
+  if (!night && gFrame % 18 < 9) {
+    ctx.fillStyle = '#ff0'; ctx.fillRect(495, H - 148, 20, 4);
+  }
+  txt('07:00', 496, H - 127, 8, '#333');
+
+  // NYC poster
+  ctx.fillStyle = '#1a3050'; ctx.fillRect(90, 75, 110, 85);
+  glowTxt('NYC', 145, 120, 20, '#ffcc00', '#ffcc0066', 'center');
+  txt('♦ ♦ ♦', 145, 142, 11, '#555', 'center');
+}
+
+function drawKitchen() {
+  ctx.fillStyle = '#1a1828'; ctx.fillRect(0, 0, W, H - 80);
+  // Floor tiles
+  for (let i = 0; i < 20; i++) {
+    ctx.fillStyle = i % 2 === 0 ? '#252535' : '#1e1e30';
+    ctx.fillRect(i * 42, H - 80, 42, 80);
+  }
+  // Counter
+  ctx.fillStyle = '#5a5a6a'; ctx.fillRect(180, H - 160, 530, 22);
+  ctx.fillStyle = '#7a7a8a'; ctx.fillRect(180, H - 180, 530, 24);
+  // Cabinets
+  for (let i = 0; i < 5; i++) {
+    ctx.fillStyle = '#7a3a10'; ctx.fillRect(185 + i * 104, 95, 98, 105);
+    ctx.strokeStyle = '#5a2a08'; ctx.lineWidth = 2;
+    ctx.strokeRect(185 + i * 104, 95, 98, 105);
+    ctx.fillStyle = '#ccc'; ctx.fillRect(225 + i * 104, 140, 18, 9);
+  }
+  // Coffee machine
+  ctx.fillStyle = '#222'; ctx.fillRect(340, H - 182, 46, 28);
+  ctx.fillStyle = '#000'; ctx.fillRect(352, H - 176, 22, 16);
+  if (gFrame % 28 < 14) {
+    fillRect(361, H - 188, 4, 8, '#ffffff44');
+    fillRect(367, H - 192, 4, 10, '#ffffff33');
+  }
+  // Mug
+  ctx.fillStyle = '#884422'; ctx.fillRect(415, H - 182, 26, 24);
+  ctx.fillStyle = '#3a1500'; ctx.fillRect(418, H - 178, 20, 16);
+  // Window
+  ctx.fillStyle = '#87bfdd'; ctx.fillRect(40, 58, 120, 105);
+  ctx.strokeStyle = '#5a3210'; ctx.lineWidth = 5; ctx.strokeRect(40, 58, 120, 105);
+  ctx.fillStyle = '#1a3a5f'; ctx.fillRect(45, 90, 28, 73);
+  ctx.fillStyle = '#0f2a3a'; ctx.fillRect(85, 78, 30, 85); ctx.fillRect(118, 98, 35, 65);
+  // Phone
+  ctx.fillStyle = '#222'; ctx.fillRect(640, H - 195, 58, 82);
+  ctx.fillStyle = '#ddf'; ctx.fillRect(642, H - 193, 54, 78);
+  txt('HN', 655, H - 168, 15, '#ff6600', 'left', true);
+  txt('CI failed', 644, H - 150, 8, '#333');
+  txt('4 new PRs', 644, H - 138, 8, '#333');
+  txt('meeting??', 644, H - 126, 8, '#333');
+  txt('🔥🔥🔥', 648, H - 112, 10, '#f00');
+}
+
+function drawOffice() {
+  ctx.fillStyle = '#141420'; ctx.fillRect(0, 0, W, H - 80);
+  ctx.fillStyle = '#1e1e2e'; ctx.fillRect(0, H - 80, W, 80);
+  // Ceiling lights
+  for (let i = 0; i < 4; i++) {
+    fillRect(70 + i * 185, 0,  105, 8,  '#ffffff18');
+    fillRect(70 + i * 185, 8,  105, 4,  '#ffffc822');
+  }
+  // 3 desks
+  const deskLines = [
+    [['> git push origin','[rejected]  main','! [remote...fail]','$ git --help'],['#ff4444','#ff4444','#ff4444','#888']],
+    [['npm install','⠸ 2418/4096...','4 high vulns','(still fine ok)'],['#888','#ffaa00','#ff4444','#888']],
+    [['slack (38🔴)','standup?','PR review?','...maybe tmrw'],['#9944ff','#ffaa00','#888','#555']],
+  ];
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = '#2a2a3a'; ctx.fillRect(50 + i * 250, H - 155, 200, 18);
+    ctx.fillRect(50 + i * 250, H - 82, 12, 58);
+    ctx.fillRect(238 + i * 250, H - 82, 12, 58);
+    ctx.fillStyle = '#0d0d0d'; ctx.fillRect(88 + i * 250, H - 208, 94, 60);
+    ctx.fillStyle = '#001428'; ctx.fillRect(91 + i * 250, H - 205, 88, 54);
+    deskLines[i][0].forEach((l, j) =>
+      txt(l, 93 + i * 250, H - 198 + j * 12, 8, deskLines[i][1][j])
+    );
+    ctx.fillStyle = '#383848'; ctx.fillRect(88 + i * 250, H - 153, 85, 12);
+    ctx.fillStyle = '#8B4513'; ctx.fillRect(205 + i * 250, H - 162, 18, 15);
+    ctx.fillStyle = '#3a1500'; ctx.fillRect(207 + i * 250, H - 160, 14, 11);
+  }
+  // Post-its
+  const pnotes = ['FIX BUG','TODO:???','WHY???','HELP ME'];
+  const pcols  = ['#ffff44','#ff8844','#88ff44','#44aaff'];
+  pnotes.forEach((n, i) => {
+    ctx.fillStyle = pcols[i]; ctx.fillRect(45 + i * 95, 50, 65, 52);
+    txt(n, 77 + i * 95, 80, 9, '#333', 'center');
+  });
+}
+
+function drawSubway() {
+  ctx.fillStyle = '#101020'; ctx.fillRect(0, 0, W, H - 80);
+  for (let i = 0; i < 27; i++) {
+    ctx.fillStyle = i % 2 === 0 ? '#1e1e30' : '#181828';
+    ctx.fillRect(i * 30, H - 80, 30, 80);
+  }
+  // Pillars
+  for (let i = 0; i < 4; i++) {
+    ctx.fillStyle = '#484858'; ctx.fillRect(90 + i * 200, 0, 22, H - 80);
+    ctx.fillStyle = '#cc6600'; ctx.fillRect(92 + i * 200, 55, 18, 35);
+    txt('F', 98 + i * 200, 79, 13, '#fff', 'left', true);
+  }
+  // Subway car
+  const cx = 280 + Math.sin(gFrame * 0.018) * 2;
+  ctx.fillStyle = '#c0c0c0'; ctx.fillRect(cx, H - 240, 430, 160);
+  ctx.fillStyle = '#0055bb'; ctx.fillRect(cx, H - 240, 430, 24);
+  for (let i = 0; i < 5; i++) {
+    ctx.fillStyle = '#88aabb'; ctx.fillRect(cx + 18 + i * 82, H - 228, 64, 52);
+    ctx.fillStyle = '#223344'; ctx.fillRect(cx + 26 + i * 82, H - 216, 22, 32);
+  }
+  ctx.fillStyle = '#999'; ctx.fillRect(cx + 188, H - 235, 46, 155);
+  // Banner
+  ctx.fillStyle = '#ffcc00'; ctx.fillRect(0, 18, W, 34);
+  txt('BROOKLYN BOUND  ·  F TRAIN  ·  NEXT STOP: JAY ST', W / 2, 40, 14, '#000', 'center', true);
+  // Platform people
+  for (let i = 0; i < 5; i++) {
+    const px = 80 + i * 150 + Math.sin(gFrame * 0.04 + i) * 2;
+    const pcol = ['#334455','#554433','#223355','#553322','#334433'][i];
+    ctx.fillStyle = pcol; ctx.fillRect(px, H - 142, 16, 48);
+    ctx.fillStyle = PAL.skin; ctx.fillRect(px + 2, H - 156, 12, 15);
+    ctx.fillStyle = '#111'; ctx.fillRect(px + 3, H - 140, 9, 14);
+    ctx.fillStyle = '#00ddff'; ctx.globalAlpha = 0.75;
+    ctx.fillRect(px + 4, H - 139, 7, 12); ctx.globalAlpha = 1;
+  }
+}
+
+function drawNews() {
+  drawNYC(false, gFrame * 1.5);
+  fillRect(0, 0, W, H, '#cc000015');
+
+  // Breaking banner
+  ctx.fillStyle = '#cc0000'; ctx.fillRect(0, 0, W, 52);
+  const bx = -((gFrame * 2.8) % (W + 900));
+  txt('⚠ BREAKING NEWS ⚠  UNIDENTIFIED CRAFT OVER MANHATTAN  ⚠  NYC EMERGENCY ALERT  ⚠  REMAIN INDOORS  ⚠  BREAKING NEWS ⚠',
+    W + 900 + bx, 34, 15, '#ffff00');
+
+  // TV
+  ctx.fillStyle = '#111'; ctx.fillRect(195, 68, 410, 290);
+  ctx.fillStyle = '#090918'; ctx.fillRect(200, 73, 400, 280);
+
+  // NYC skyline silhouette
+  ctx.fillStyle = '#0a0a1a';
+  [[220,280,40],[265,300,65],[320,290,40],[355,310,80],[425,285,55],
+   [470,305,75],[530,280,50],[565,300,65],[610,290,45],[645,310,80]].forEach(([bx, bmax, bw]) => {
+    ctx.fillRect(bx, bmax, bw, 353 - bmax);
+  });
+
+  // UFOs over skyline
+  for (let i = 0; i < 5; i++) {
+    const ux = 215 + i * 78 + Math.sin(gFrame * 0.03 + i) * 6;
+    const uy = 145 + i * 18 + Math.sin(gFrame * 0.05 + i * 2) * 9;
+    ctx.fillStyle = '#8899aa'; ctx.fillRect(ux + 5, uy + 5, 32, 10);
+    ctx.fillStyle = '#aabbcc'; ctx.fillRect(ux + 12, uy, 20, 9);
+    ctx.fillStyle = '#00ddff'; ctx.globalAlpha = 0.5 + Math.sin(gFrame * 0.12 + i) * 0.25;
+    ctx.fillRect(ux + 14, uy + 2, 16, 6); ctx.globalAlpha = 1;
+    ctx.fillStyle = `rgba(80,255,80,${0.07 + Math.sin(gFrame * 0.1 + i) * 0.03})`;
+    ctx.fillRect(ux + 14, uy + 14, 16, 50);
+  }
+
+  // News bar
+  ctx.fillStyle = '#ffcc00'; ctx.fillRect(200, 333, 400, 22);
+  txt('"GOD HELP US ALL." — NYC MAYOR', W / 2, 349, 10, '#000', 'center', true);
+  // Live badge
+  ctx.fillStyle = '#cc0000'; ctx.fillRect(203, 76, 80, 28);
+  txt('● LIVE', 208, 95, 13, '#ffff00', 'left', true);
+
+  // Alex reaction box
+  fillRect(0, H - 130, W, 130, 'rgba(0,3,12,0.93)');
+  strokeRect(0, H - 130, W, 130, '#ff0044', 1);
+  fillRect(10, H - 122, 74, 114, '#0a0a20');
+  strokeRect(10, H - 122, 74, 114, '#ff0044', 1);
+  drawPlayer(26, H - 108, 1, 'scene');
+  txt('ALEX', 46, H - 12, 9, '#ff0044', 'center');
+
+  txt("No... this can't be real.", 98, H - 100, 13, PAL.text);
+  txt('I just passed code review today...', 98, H - 76, 13, PAL.text);
+  glowTxt('OK. Developer mode: ON.', 98, H - 48, 14, '#ff4444', '#ff000088', 'left');
+
+  if (gFrame % 55 < 38)
+    glowTxt('[ CLICK OR SPACE — FIGHT BACK ]', W / 2, H - 14, 12, '#ff0044', '#ff004488', 'center');
+}
+
+function drawInvasion() {
+  drawNYC(false, bgScroll);
+
+  // Aim guide line (subtle)
+  const angle = Math.atan2(my - (P.y + 14), mx - (P.x + P.w / 2));
+  ctx.strokeStyle = '#ffff0018'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(P.x + P.w / 2, P.y + 14);
+  ctx.lineTo(P.x + P.w / 2 + Math.cos(angle) * 180, P.y + 14 + Math.sin(angle) * 180);
+  ctx.stroke();
+  // Crosshair dot at cursor
+  ctx.strokeStyle = '#ffff0055'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(mx, my, 8, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = '#ffff0066'; ctx.fillRect(mx - 1, my - 8, 2, 16);
+  ctx.fillRect(mx - 8, my - 1, 16, 2);
+
+  // Bullets
+  bullets.forEach(b => {
+    ctx.shadowColor = b.col; ctx.shadowBlur = 8;
+    ctx.fillStyle = b.col;
+    ctx.fillRect(b.x - b.sz / 2, b.y - b.sz / 2, b.sz, b.sz);
+    ctx.shadowBlur = 0;
+  });
+
+  // Aliens
+  aliens.forEach(drawAlien);
+
+  // Pickups
+  drawPickups();
+
+  // Sparks
+  drawSparks();
+
+  // Player
+  drawPlayer(P.x, P.y, P.dir, 'invasion');
+
+  // HUD
+  drawHUD();
+
+  // Screen flash
+  if (flashTimer > 0) {
+    fillRect(0, 0, W, H, flashColor, flashTimer * 0.04);
+    flashTimer--;
+  }
+
+  // Low HP warning
+  if (P.hp < 28 && P.hp > 0) {
+    fillRect(0, 0, W, H, '#ff0000', 0.05 + Math.sin(gFrame * 0.22) * 0.04);
+    if (gFrame % 40 < 20) glowTxt('⚠ CRITICAL ⚠', W / 2, 62, 22, '#ff0000', '#ff0000', 'center');
+  }
+}
+
+function drawGameOver() {
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  drawSparks();
+
+  glowTxt('GAME OVER', W / 2, H / 2 - 110, 68, '#ff0044', '#ff0044', 'center');
+  txt('Alex has been vaporized by aliens.', W / 2, H / 2 - 52, 14, '#666', 'center');
+  txt('Next time: ship faster, die slower.', W / 2, H / 2 - 32, 12, '#444', 'center');
+
+  fillRect(W / 2 - 165, H / 2 - 16, 330, 110, '#0a0a18');
+  strokeRect(W / 2 - 165, H / 2 - 16, 330, 110, '#ff0044', 1);
+  txt('FINAL SCORE', W / 2, H / 2 + 10, 12, '#666', 'center');
+  glowTxt(String(score), W / 2, H / 2 + 58, 56, PAL.neonY, '#ffff0066', 'center');
+  txt('ALIENS KILLED: ' + aliensKilled, W / 2, H / 2 + 85, 13, '#ff4444', 'center');
+
+  if (gFrame % 55 < 38)
+    txt('[ PRESS SPACE OR CLICK TO TRY AGAIN ]', W / 2, H / 2 + 135, 13, '#444', 'center');
+}
+
+// ─── INPUT HANDLERS ──────────────────────────────────────────
+function onKey(code) {
+  if (gState === 'title' && (code === 'Space' || code === 'Enter')) startGame();
+  else if (gState === 'gameover' && (code === 'Space' || code === 'Enter')) resetGame();
+  else if (gState === 'daytrans' && (code === 'Space' || code === 'Enter')) beginDay();
+  else if (gState === 'scene' && (code === 'Space' || code === 'Enter')) nextScene();
+  else if (gState === 'news' && (code === 'Space' || code === 'Enter')) startInvasion();
+  else if (gState === 'invasion' && code === 'Space' && P.onGround) {
+    P.vy = -11; P.onGround = false;
+  } else if (gState === 'invasion' && (code === 'KeyZ' || code === 'KeyF')) {
+    fireBullet();
+  }
+}
+
+function onMouseDown() {
+  if (gState === 'title')   { startGame(); return; }
+  if (gState === 'gameover'){ resetGame(); return; }
+  if (gState === 'daytrans'){ beginDay();  return; }
+  if (gState === 'scene')   { nextScene(); return; }
+  if (gState === 'news')    { startInvasion(); return; }
+  if (gState === 'invasion'){ fireBullet(); }
+}
+
+// ─── GAME FLOW ────────────────────────────────────────────────
+function startGame() {
+  sfx.uiClick();
+  day = 1; score = 0;
+  gState = 'daytrans'; transTimer = 0;
+}
+
+function resetGame() {
+  aliens = []; bullets = []; sparks = []; pickups = [];
+  aliensKilled = 0; waveNum = 0; score = 0; bgScroll = 0;
+  waveSpawnCD = 100;
+  P.hp = P.maxHp; P.x = 120; P.y = 0; P.vx = 0; P.vy = 0;
+  P.rapidTimer = 0; P.invTimer = 0; P.shootCD = 0;
+  gState = 'title'; gFrame = 0;
+}
+
+function beginDay() {
+  sfx.uiClick();
+  if (day > 3) { gState = 'news'; gFrame = 0; return; }
+  sceneIdx = 0; sceneTimer = 0;
+  gState = 'scene';
+}
+
+function nextScene() {
+  sfx.uiClick();
+  sceneIdx++;
+  sceneTimer = 0;
+  const scenes = DAYS[day];
+  if (!scenes || sceneIdx >= scenes.length) {
+    day++;
+    if (day > 3) { gState = 'news'; gFrame = 0; }
+    else { gState = 'daytrans'; transTimer = 0; }
+  }
+}
+
+function startInvasion() {
+  sfx.uiClick();
+  aliens = []; bullets = []; sparks = []; pickups = [];
+  aliensKilled = 0; waveNum = 0; score = 0; bgScroll = 0;
+  waveSpawnCD = 100;
+  P.hp = P.maxHp; P.x = 120; P.y = H - 80 - P.h;
+  P.vx = 0; P.vy = 0; P.rapidTimer = 0; P.invTimer = 0;
+  gState = 'invasion'; gFrame = 0;
+}
+
+// ─── MAIN LOOP ────────────────────────────────────────────────
+function loop() {
+  gFrame++;
+  if (gState === 'daytrans') transTimer++;
+
+  // Update
+  if (gState === 'invasion') {
+    updatePlayer();
+    updateAliens();
+    updateBullets();
+    updateSparks();
+    updateWaves();
+    if (P.hp <= 0) {
+      gState = 'gameover';
+      sfx.death();
+      spawnSparks(P.x + 12, P.y + 18, '#ff4444', 35);
+      gFrame = 0;
+    }
+  }
+
+  // Render
+  ctx.clearRect(0, 0, W, H);
+  if (gState === 'title')   drawTitle();
+  else if (gState === 'daytrans') drawDayTransition();
+  else if (gState === 'scene')    drawScene();
+  else if (gState === 'news')     drawNews();
+  else if (gState === 'invasion') drawInvasion();
+  else if (gState === 'gameover') drawGameOver();
+
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>
